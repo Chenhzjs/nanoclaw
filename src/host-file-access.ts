@@ -98,7 +98,10 @@ export function approveDirectory(
     approvedBy: chatJid,
   });
   saveApprovals();
-  logger.info({ path: resolved, readOnly }, 'Directory approved for file access');
+  logger.info(
+    { path: resolved, readOnly },
+    'Directory approved for file access',
+  );
 }
 
 /**

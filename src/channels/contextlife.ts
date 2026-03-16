@@ -144,7 +144,10 @@ class ContextLifeChannel implements Channel {
 
       if (result.ok) {
         if (!this.connected) {
-          logger.info({ hub: HUB_URL, bot: BOT_NAME }, 'ContextLife channel connected');
+          logger.info(
+            { hub: HUB_URL, bot: BOT_NAME },
+            'ContextLife channel connected',
+          );
         }
         this.connected = true;
       }
@@ -259,7 +262,10 @@ class ContextLifeChannel implements Channel {
     } catch (err) {
       // Connection lost — mark as disconnected, will auto-reconnect next poll
       if (this.connected) {
-        logger.warn({ err }, 'ContextLife Hub connection lost (will auto-reconnect)');
+        logger.warn(
+          { err },
+          'ContextLife Hub connection lost (will auto-reconnect)',
+        );
         this.connected = false;
       }
     }

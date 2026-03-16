@@ -151,8 +151,16 @@ export function startIpcWatcher(deps: IpcDeps): void {
       }
 
       // Process file access requests from this group's IPC directory
-      const fileRequestsDir = path.join(ipcBaseDir, sourceGroup, 'file-requests');
-      const fileResponsesDir = path.join(ipcBaseDir, sourceGroup, 'file-responses');
+      const fileRequestsDir = path.join(
+        ipcBaseDir,
+        sourceGroup,
+        'file-requests',
+      );
+      const fileResponsesDir = path.join(
+        ipcBaseDir,
+        sourceGroup,
+        'file-responses',
+      );
       try {
         if (fs.existsSync(fileRequestsDir)) {
           const reqFiles = fs
@@ -165,16 +173,29 @@ export function startIpcWatcher(deps: IpcDeps): void {
               fs.unlinkSync(filePath);
               // Handle async — don't block the IPC loop
               processFileRequest(data, fileResponsesDir, deps).catch((err) => {
-                logger.error({ err, file, sourceGroup }, 'Error processing file request');
+                logger.error(
+                  { err, file, sourceGroup },
+                  'Error processing file request',
+                );
               });
             } catch (err) {
-              logger.error({ file, sourceGroup, err }, 'Error reading file request');
-              try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+              logger.error(
+                { file, sourceGroup, err },
+                'Error reading file request',
+              );
+              try {
+                fs.unlinkSync(filePath);
+              } catch {
+                /* ignore */
+              }
             }
           }
         }
       } catch (err) {
-        logger.error({ err, sourceGroup }, 'Error reading file-requests directory');
+        logger.error(
+          { err, sourceGroup },
+          'Error reading file-requests directory',
+        );
       }
     }
 
@@ -545,7 +566,10 @@ async function processFileRequest(
     requestId,
     filePath,
     reason,
-    type: data.type as 'file_request' | 'file_write_request' | 'dir_list_request',
+    type: data.type as
+      | 'file_request'
+      | 'file_write_request'
+      | 'dir_list_request',
     content: data.content,
     groupFolder,
     chatJid,
