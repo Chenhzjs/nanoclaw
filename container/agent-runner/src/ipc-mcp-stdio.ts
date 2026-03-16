@@ -333,6 +333,154 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
+// ── Host file access (request → approval → read via IPC) ────────────────────
+
+const FILE_REQUESTS_DIR = path.join(IPC_DIR, 'file-requests');
+const FILE_RESPONSES_DIR = path.join(IPC_DIR, 'file-responses');
+fs.mkdirSync(FILE_REQUESTS_DIR, { recursive: true });
+fs.mkdirSync(FILE_RESPONSES_DIR, { recursive: true });
+
+function waitForFileResponse(requestId: string, timeoutMs = 120_000): Promise<{ ok: boolean; content?: string; error?: string }> {
+  const responseFile = path.join(FILE_RESPONSES_DIR, `${requestId}.json`);
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const poll = () => {
+      if (fs.existsSync(responseFile)) {
+        try {
+          const data = JSON.parse(fs.readFileSync(responseFile, 'utf-8'));
+          fs.unlinkSync(responseFile);
+          resolve(data);
+        } catch {
+          resolve({ ok: false, error: 'Failed to parse response' });
+        }
+        return;
+      }
+      if (Date.now() > deadline) {
+        resolve({ ok: false, error: 'Timed out waiting for host approval (2 min)' });
+        return;
+      }
+      setTimeout(poll, 500);
+    };
+    poll();
+  });
+}
+
+server.tool(
+  'read_host_file',
+  `Read a file from the host machine (outside the container). The host user will be asked to approve the access. Use this when you need to read files that are not mounted in the container workspace.
+
+Approved directories are remembered for the session, so subsequent reads under the same directory won't require re-approval.
+
+Returns the file content as text. For binary files, returns a base64-encoded string.`,
+  {
+    path: z.string().describe('Absolute path on the host machine (e.g. "C:\\\\Users\\\\name\\\\code\\\\project\\\\file.ts" or "/home/user/project/file.ts")'),
+    reason: z.string().describe('Brief explanation of why you need this file (shown to the user for approval)'),
+  },
+  async (args) => {
+    const requestId = `freq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    writeIpcFile(FILE_REQUESTS_DIR, {
+      type: 'file_request',
+      requestId,
+      filePath: args.path,
+      reason: args.reason,
+      groupFolder,
+      chatJid,
+      isMain,
+      timestamp: new Date().toISOString(),
+    });
+
+    const response = await waitForFileResponse(requestId);
+
+    if (!response.ok) {
+      return {
+        content: [{ type: 'text' as const, text: `File access denied or failed: ${response.error || 'unknown error'}` }],
+        isError: true,
+      };
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: response.content || '' }],
+    };
+  },
+);
+
+server.tool(
+  'write_host_file',
+  `Write content to a file on the host machine (outside the container). The host user will be asked to approve the write. Use this when you need to save results to the host filesystem.
+
+Approved directories are remembered for the session.`,
+  {
+    path: z.string().describe('Absolute path on the host machine'),
+    content: z.string().describe('Content to write to the file'),
+    reason: z.string().describe('Brief explanation of why you need to write this file (shown to the user for approval)'),
+  },
+  async (args) => {
+    const requestId = `fwreq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    writeIpcFile(FILE_REQUESTS_DIR, {
+      type: 'file_write_request',
+      requestId,
+      filePath: args.path,
+      content: args.content,
+      reason: args.reason,
+      groupFolder,
+      chatJid,
+      isMain,
+      timestamp: new Date().toISOString(),
+    });
+
+    const response = await waitForFileResponse(requestId);
+
+    if (!response.ok) {
+      return {
+        content: [{ type: 'text' as const, text: `File write denied or failed: ${response.error || 'unknown error'}` }],
+        isError: true,
+      };
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: response.content || 'File written successfully.' }],
+    };
+  },
+);
+
+server.tool(
+  'list_host_directory',
+  `List files and directories at a path on the host machine. The host user will be asked to approve the access.`,
+  {
+    path: z.string().describe('Absolute directory path on the host machine'),
+    reason: z.string().describe('Brief explanation (shown to the user for approval)'),
+  },
+  async (args) => {
+    const requestId = `dlreq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    writeIpcFile(FILE_REQUESTS_DIR, {
+      type: 'dir_list_request',
+      requestId,
+      filePath: args.path,
+      reason: args.reason,
+      groupFolder,
+      chatJid,
+      isMain,
+      timestamp: new Date().toISOString(),
+    });
+
+    const response = await waitForFileResponse(requestId);
+
+    if (!response.ok) {
+      return {
+        content: [{ type: 'text' as const, text: `Directory access denied or failed: ${response.error || 'unknown error'}` }],
+        isError: true,
+      };
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: response.content || '' }],
+    };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

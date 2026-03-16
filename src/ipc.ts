@@ -7,6 +7,11 @@ import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
+import {
+  approveDirectory,
+  isPathApproved,
+  requestApproval,
+} from './host-file-access.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
@@ -143,6 +148,33 @@ export function startIpcWatcher(deps: IpcDeps): void {
         }
       } catch (err) {
         logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
+      }
+
+      // Process file access requests from this group's IPC directory
+      const fileRequestsDir = path.join(ipcBaseDir, sourceGroup, 'file-requests');
+      const fileResponsesDir = path.join(ipcBaseDir, sourceGroup, 'file-responses');
+      try {
+        if (fs.existsSync(fileRequestsDir)) {
+          const reqFiles = fs
+            .readdirSync(fileRequestsDir)
+            .filter((f) => f.endsWith('.json'));
+          for (const file of reqFiles) {
+            const filePath = path.join(fileRequestsDir, file);
+            try {
+              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              fs.unlinkSync(filePath);
+              // Handle async — don't block the IPC loop
+              processFileRequest(data, fileResponsesDir, deps).catch((err) => {
+                logger.error({ err, file, sourceGroup }, 'Error processing file request');
+              });
+            } catch (err) {
+              logger.error({ file, sourceGroup, err }, 'Error reading file request');
+              try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+            }
+          }
+        }
+      } catch (err) {
+        logger.error({ err, sourceGroup }, 'Error reading file-requests directory');
       }
     }
 
@@ -451,5 +483,145 @@ export async function processTaskIpc(
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
+  }
+}
+
+// ── Host file access request handler ─────────────────────────────────────────
+
+function writeFileResponse(
+  responseDir: string,
+  requestId: string,
+  data: { ok: boolean; content?: string; error?: string },
+): void {
+  fs.mkdirSync(responseDir, { recursive: true });
+  const tempPath = path.join(responseDir, `${requestId}.json.tmp`);
+  const finalPath = path.join(responseDir, `${requestId}.json`);
+  fs.writeFileSync(tempPath, JSON.stringify(data));
+  fs.renameSync(tempPath, finalPath);
+}
+
+async function processFileRequest(
+  data: {
+    type: string;
+    requestId: string;
+    filePath: string;
+    reason: string;
+    content?: string;
+    groupFolder: string;
+    chatJid: string;
+    isMain: boolean;
+  },
+  responseDir: string,
+  deps: IpcDeps,
+): Promise<void> {
+  const { requestId, filePath, reason, chatJid, groupFolder } = data;
+  const needsWrite = data.type === 'file_write_request';
+  const isDirList = data.type === 'dir_list_request';
+
+  logger.info(
+    { requestId, type: data.type, filePath, groupFolder },
+    'Processing file access request',
+  );
+
+  // Check if already approved
+  if (isPathApproved(filePath, needsWrite)) {
+    logger.info({ requestId, filePath }, 'Path already approved, executing');
+    return executeFileOp(data, responseDir);
+  }
+
+  // Ask user for approval
+  const parentDir = isDirList ? filePath : path.dirname(filePath);
+  const opLabel = needsWrite ? '写入' : isDirList ? '列出目录' : '读取';
+  const approvalMsg =
+    `🔐 NanoClaw 请求${opLabel}宿主机文件:\n` +
+    `📁 ${filePath}\n` +
+    `💬 原因: ${reason}\n\n` +
+    `回复 Y 允许访问 ${parentDir} 目录（后续同目录不再询问），N 拒绝`;
+
+  await deps.sendMessage(chatJid, approvalMsg);
+
+  // Wait for user reply
+  const approved = await requestApproval({
+    requestId,
+    filePath,
+    reason,
+    type: data.type as 'file_request' | 'file_write_request' | 'dir_list_request',
+    content: data.content,
+    groupFolder,
+    chatJid,
+  });
+
+  if (!approved) {
+    logger.info({ requestId, filePath }, 'File access denied by user');
+    writeFileResponse(responseDir, requestId, {
+      ok: false,
+      error: 'Access denied by user',
+    });
+    return;
+  }
+
+  // Approve the parent directory for future requests
+  approveDirectory(parentDir, !needsWrite, chatJid);
+  await deps.sendMessage(chatJid, `✅ 已授权访问 ${parentDir}`);
+
+  return executeFileOp(data, responseDir);
+}
+
+function executeFileOp(
+  data: {
+    type: string;
+    requestId: string;
+    filePath: string;
+    content?: string;
+  },
+  responseDir: string,
+): void {
+  const { requestId, filePath } = data;
+
+  try {
+    if (data.type === 'dir_list_request') {
+      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isDirectory()) {
+        writeFileResponse(responseDir, requestId, {
+          ok: false,
+          error: `Not a directory: ${filePath}`,
+        });
+        return;
+      }
+      const entries = fs.readdirSync(filePath, { withFileTypes: true });
+      const listing = entries
+        .map((e) => `${e.isDirectory() ? '[DIR] ' : '      '}${e.name}`)
+        .join('\n');
+      writeFileResponse(responseDir, requestId, { ok: true, content: listing });
+    } else if (data.type === 'file_write_request') {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, data.content || '', 'utf-8');
+      writeFileResponse(responseDir, requestId, {
+        ok: true,
+        content: `Written ${(data.content || '').length} bytes to ${filePath}`,
+      });
+    } else {
+      // file_request (read)
+      if (!fs.existsSync(filePath)) {
+        writeFileResponse(responseDir, requestId, {
+          ok: false,
+          error: `File not found: ${filePath}`,
+        });
+        return;
+      }
+      const stat = fs.statSync(filePath);
+      if (stat.size > 5 * 1024 * 1024) {
+        writeFileResponse(responseDir, requestId, {
+          ok: false,
+          error: `File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB, max 5MB)`,
+        });
+        return;
+      }
+      const content = fs.readFileSync(filePath, 'utf-8');
+      writeFileResponse(responseDir, requestId, { ok: true, content });
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error({ requestId, filePath, err: msg }, 'File operation failed');
+    writeFileResponse(responseDir, requestId, { ok: false, error: msg });
   }
 }

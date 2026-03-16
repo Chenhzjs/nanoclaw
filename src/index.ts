@@ -44,6 +44,10 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
+import {
+  hasPendingApproval,
+  tryResolveApprovalFromReply,
+} from './host-file-access.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -491,6 +495,15 @@ async function main(): Promise<void> {
   // Channel callbacks (shared by all channels)
   const channelOpts = {
     onMessage: (chatJid: string, msg: NewMessage) => {
+      // Intercept file access approval replies before anything else
+      if (
+        !msg.is_bot_message &&
+        hasPendingApproval(chatJid) &&
+        tryResolveApprovalFromReply(chatJid, msg.content)
+      ) {
+        return; // consumed by approval flow, don't store or process
+      }
+
       // Sender allowlist drop mode: discard messages from denied senders before storing
       if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
         const cfg = loadSenderAllowlist();
